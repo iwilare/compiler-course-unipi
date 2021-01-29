@@ -10,3 +10,11 @@ int getint() {
 void print(int n) {
     printf("%d\n", n);
 }
+
+void printfloat(float f) {
+    printf("%.3f\n", f); // With just %f it might be platform-dependent
+}
+
+void printchar(char c) {
+    printf("%c", c);
+}

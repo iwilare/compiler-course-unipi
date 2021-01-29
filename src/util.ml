@@ -3,16 +3,11 @@ exception Lexing_error   of string
 exception Semantic_error of string
 exception Codegen_error  of string
 
-(* Transforms a list of options into an option of list.
-   Inspired by Haskell's `sequence` :: Monad m => t (m a) -> m (t a)
-   function defined in the Traversable typeclass. *)
-let rec sequence : 'a option list -> 'a list option = function
-  | [] -> Some([])
-  | (Some(x)) :: xs ->
-    (match sequence xs with
-      | Some(ls) -> Some(x :: ls)
-      | None     -> None)
-  | None :: _ -> None
+(* Utility function to define hash tables out of lists. *)
+let create_hashtable init =
+  let tbl = Hashtbl.create (List.length init) in
+  List.iter (fun (key, data) -> Hashtbl.add tbl key data) init;
+  tbl
 
 let get_lexing_position lexbuf =
   let p = Lexing.lexeme_start_p lexbuf in

@@ -1,20 +1,29 @@
 open Ast
+open Position
 
 (* The type and name of the main entry point *)
 let main_name = "main"
 
-(* Information for functions contained in the symbol table *)
+(* Information for functions contained in the symbol table.
+   Each function can be either builtin or declared with a fundecl. *)
 type fun_info =
   | Builtin of typ * typ list
   | Fundef of position fundecl
 
-(* Information for variables contained the symbol table *)
+(* Information for variables contained in the symbol table.
+   Each variable is identified with its type and where it
+   has been declared. *)
 type var_info = position * typ
 
+(* Information for structs contained in the symbol table.
+   Each struct is a namespace of field variables. *)
+type struct_info = var_info Symbol_table.t
+
 (* The main symbol table carried around during semantic checking,
-   contains the namespaces for functions and variables *)
-type sym = { fun_sym : fun_info Symbol_table.t
-           ; var_sym : var_info Symbol_table.t
+   contains the namespaces for functions, variables and struct types. *)
+type sym = { fun_sym    : fun_info    Symbol_table.t
+           ; var_sym    : var_info    Symbol_table.t
+           ; struct_sym : struct_info Symbol_table.t
            }
 
 (* The type of the semantic annotation output during semantic checking.
@@ -24,27 +33,31 @@ type semantic = typ
 
 (**
   Determine whether a type has a completely defined size, known at
-  compilation time. In C only complete types can be elements of arrays.
+  compilation time. In C only complete types can be elements of arrays and structs.
   @param t the type to check
   @returns true iff the type is complete *)
 let rec is_complete_type t = match t with
-  | TypA(t, Some(_)) -> is_complete_type t (* Recursively check that the size is complete *)
+  | TypA(t, Some(_)) -> is_complete_type t (* Recursively check that the array element is complete *)
   | TypA(t, None)    -> false              (* Unbounded arrays have unknown size *)
   | _                -> true               (* Else, basic types and pointers have fixed size *)
 
 (**
-  Check that a type is valid.
+  Check that a type is valid:
     - Array size must be greater than 1
     - Array element types must have size known at runtime
   @param loc the location to report the error to if an error occurs
   @param t the type to check
   @throws Semantic_error if an error occurs
 *)
-let check_type loc t = match t with
+let check_type struct_sym loc t = match t with
   | TypA(t, Some(i)) when i < 1 ->
     Util.raise_semantic_error loc @@ "Array size must be greater-than-zero, found " ^ string_of_int(i) ^ "."
   | TypA(t, _) when not (is_complete_type t) ->
     Util.raise_semantic_error loc @@ "Invalid incomplete type " ^ show_typ(t) ^ " as array element."
+  | TypS(s) ->
+    (match Symbol_table.lookup s struct_sym with
+      | Some(t) -> ()
+      | None -> Util.raise_semantic_error loc @@ "Undefined struct " ^ show_identifier(s) ^ ".")
   | _ -> ()
 
 (**
@@ -55,10 +68,10 @@ let check_type loc t = match t with
   @param t the type to check
   @throws Semantic_error if an error occurs
  *)
-let check_function_return_type loc t = match t with
+let check_function_return_type struct_sym loc t = match t with
   | TypP(_) -> Util.raise_semantic_error loc "Invalid function return type, cannot be pointer."
   | TypA(_) -> Util.raise_semantic_error loc "Invalid function return type, cannot be array."
-  | _       -> check_type loc t
+  | _       -> check_type struct_sym loc t
 
 (**
   Check that the type used in a variable is valid.
@@ -67,10 +80,41 @@ let check_function_return_type loc t = match t with
   @param t the type to check
   @throws Semantic_error if an error occurs
  *)
-let check_var_type loc t = match t with
+let check_var_type struct_sym loc t = match t with
   | TypV       -> Util.raise_semantic_error loc "Variable cannot be defined with type void."
   | TypP(TypV) -> Util.raise_semantic_error loc "Invalid reserved NULL type."
-  | _          -> check_type loc t
+  | _          -> check_type struct_sym loc t
+
+(**
+  Check that the type argument given a function is valid.
+  Furthermore, return the type that the function actually
+  requires, called "implementation type": in the case of arrays,
+  this corresponds to converting them to a unbounded array, thus
+  discarding the first size. This is necessary in order to preserve
+  the pass-by-reference semantics of arrays and not return copies of arrays.
+  Under the hood, this is also what Clang does when dealing with sized
+  arrays in function arguments.
+  @param loc the location to report the error to if an error occurs
+  @param t the type to check
+  @return the implementation type for the function argument
+  @throws Semantic_error if an error occurs
+ *)
+let check_function_argument_type struct_sym loc t =
+  check_type struct_sym loc t;
+  match t with
+  (* Functions that accept sized arrays effectively receive
+     just a pointer to the array, without copying it *)
+  | TypA(t, Some(_)) -> TypA(t, None)
+  | t                -> t
+
+(**
+  Helper function incapsulating the implementation type of strings.
+  Strings are implemented as a sized array of characters that includes
+  the string length along with the zero-terminator.
+  @param the string for which the type must be given
+  @return the corresponding implementation typ
+ *)
+let string_type s = (TypA(TypC, Some(String.length s + 1)))
 
 (**
   Unify a provided type with an expected one.
@@ -161,14 +205,7 @@ let rec check_access sym a =
      | TypP(TypV) -> Util.raise_semantic_error a.ann @@ "Cannot directly dereference NULL type."
      | TypP(t)    -> annotate t @@ AccDeref(et)
      | t          -> Util.raise_semantic_error a.ann @@ "Cannot dereference non-pointer type exprssion with type " ^ show_typ(t) ^ ".")
-  | AccIncr(a,p,i) ->
-    let at = check_access sym a in
-    (* For simplicity, we only allow post/pre increment and decrement operations
-       on integer and float types, since no pointer arithmetic is yet implemented *)
-    (match at.ann with
-     | (TypI | TypF) as t -> annotate t @@ AccIncr(at,p,i)
-     | t -> Util.raise_semantic_error a.ann @@ "Invalid post/pre-increment/decrement expression with type " ^ show_typ(t) ^ ".")
-  | AccIndex(a,e) ->
+  | AccIndex(a, e) ->
     let et = check_expr sym e in
     (match et.ann with
      | TypI ->
@@ -177,10 +214,24 @@ let rec check_access sym a =
         | TypA(t, _) -> annotate t @@ AccIndex(at,et)
         | t -> Util.raise_semantic_error a.ann @@ "Invalid indexing with non-array type " ^ show_typ(t) ^ ".")
      | t -> Util.raise_semantic_error a.ann @@ "Invalid indexing with non-integer index " ^ show_typ(t) ^ ".")
+  | AccStruct(a, m) ->
+    let at = check_access sym a in
+    (match at.ann with
+     | TypS(sname) ->
+       let at = check_access sym a in
+       (match Symbol_table.lookup sname sym.struct_sym with
+        | Some(fields) ->
+          (match Symbol_table.lookup m fields with
+            | Some(_, typ) -> annotate typ @@ AccStruct(at, m)
+            | None -> Util.raise_semantic_error a.ann @@ "Undefined field \"" ^ m ^ "\" in expression with type \"" ^ show_typ(at.ann) ^ "\".")
+        | None -> Util.raise_semantic_error a.ann @@ "Undefined struct type \"" ^ show_identifier(sname) ^ "\".")
+     | t -> Util.raise_semantic_error a.ann @@ "Invalid member access with non-struct type " ^ show_typ(t) ^ ".")
 
 (**
   Semantically check an lvalue access expression.
-  The only non-trivial check here performed is the fact that arrays cannot be reassigned.
+  The only non-trivial check here performed is the fact that standard arrays
+  cannot be reassigned. String literals are not an exception to this rule,
+  and for simplicity they can only be assigned at the global top-level.
   @param sym the current symbol table
   @param a the access expression
   @returns the semantically annotated AST for this expression
@@ -189,8 +240,8 @@ let rec check_access sym a =
 and check_lvalue sym a =
   let at = check_access sym a in
   match at.ann with
-  | TypA(_, _) -> Util.raise_semantic_error a.ann "Cannot reassign array value."
-  | _ -> at
+  | TypA(_, _)       -> Util.raise_semantic_error a.ann "Cannot reassign array value."
+  | _                -> at
 
 (**
   Semantically check an expr AST expression.
@@ -210,13 +261,14 @@ and check_expr sym e =
      Note that we cannot use just use TypV, as it might be
      the return type of a function. This later simplifies
      the type checking and type compatibility. *)
-  | Null        -> annotate (TypP(TypV)) Null
-  | ILiteral(e) -> annotate TypI         (ILiteral(e))
-  | CLiteral(e) -> annotate TypC         (CLiteral(e))
-  | BLiteral(e) -> annotate TypB         (BLiteral(e))
-  | FLiteral(e) -> annotate TypF         (FLiteral(e))
-  | SLiteral(e) -> annotate (TypP TypC)  (SLiteral(e))
-  | Access(a)          -> (** Simply reapply the same annotation to the access expression. *)
+  | Null               -> annotate (TypP(TypV)) Null
+  | ILiteral(e)        -> annotate TypI         (ILiteral(e))
+  | CLiteral(e)        -> annotate TypC         (CLiteral(e))
+  | BLiteral(e)        -> annotate TypB         (BLiteral(e))
+  | FLiteral(e)        -> annotate TypF         (FLiteral(e))
+  | SLiteral(e)        -> (* Return the corresponding implementation type of strings for the given literal. *)
+                          annotate (string_type e) (SLiteral(e))
+  | Access(a)          -> (* Simply reapply the same annotation to the access expression. *)
                           lift_annotation (fun a -> Access(a)) @@ check_access sym a
   | Addr(a)            -> let at = check_access sym a in
                           annotate (TypP(at.ann)) (Addr(at))
@@ -225,7 +277,7 @@ and check_expr sym e =
                           (match unify tl.ann tr with
                             | Some(utr) -> annotate tl.ann (Assign(tl, utr))
                             | None -> Util.raise_semantic_error r.ann @@ "Trying to assign a value of type " ^ show_typ(tr.ann) ^ " to an lvalue with type " ^ show_typ(tl.ann) ^ ".")
-  | AssignOp(l, op, r) -> (** Utility function to JUST simplify validity checking.
+  | AssignOp(l, op, r) -> (* Utility function to JUST simplify validity checking.
                               The expression is NOT desugared here. *)
                           let desugar_assign_op l op r =
                             annotate l.ann @@
@@ -245,6 +297,13 @@ and check_expr sym e =
   | Call(f, values)    -> let args = List.map (check_expr sym) values in
                           let (return_type, unified_args) = check_function_call loc sym f args in
                           annotate return_type (Call(f, unified_args))
+  | Increment(a, p, i) ->
+    let at = check_access sym a in
+    (* For simplicity, we only allow post/pre increment and decrement operations
+       on integer and float types, since no pointer arithmetic is yet implemented *)
+    (match at.ann with
+     | (TypI | TypF) as t -> annotate t @@ Increment(at, p, i)
+     | t -> Util.raise_semantic_error a.ann @@ "Invalid post/pre-increment/decrement expression with type " ^ show_typ(t) ^ ".")
 
 (**
   Helper function to semantically check arguments in a function call.
@@ -282,10 +341,45 @@ and check_function_call loc sym f args =
   @throws Semantic_error if an error occurs
 *)
 let check_vardecl loc sym (t, id) =
-  check_var_type loc t;
-  try  Symbol_table.add_entry id (loc, t) sym.var_sym |> ignore; sym
+  check_var_type sym.struct_sym loc t;
+  try  Symbol_table.add_entry id (loc, t) sym.var_sym |> ignore
   with Symbol_table.DuplicateEntry ->
     Util.raise_semantic_error loc "Variable already declared in the same scope."
+
+(**
+  Encapsulates the logic of allowed global compile-time values.
+  For simplicity, the expression is simply checked to be a constant that
+  performs no compile-time calculations.
+  @param sym the current symbol table
+  @param e the expression being checked
+  @return the semantically-checked expression given
+  @throws Semantic_error if an error occurs
+*)
+let check_global_value sym t e = match e.node with
+  | SLiteral(_) | ILiteral(_) | CLiteral(_) | BLiteral(_) | FLiteral(_)
+  | Null -> check_expr sym e
+  | _ -> Util.raise_semantic_error e.ann "Invalid non-constant initialization element."
+
+(**
+  Semantically check a global variable declaration. This also encapsulates
+  the fact that the value of a global variable must be compile-time constant.
+  @returns the optionally type checked initial value of the variable
+  @param loc the location to report the error to if an error occurs
+  @param sym the current symbol table
+  @return the constant-time value that initializes the variable
+  @throws Semantic_error if an error occurs
+*)
+let check_global_vardecl loc sym (t, id) init =
+  check_vardecl loc sym (t, id);
+  (* Check that the global value has a compile-time defined size *)
+  (if not (is_complete_type t) then
+      Util.raise_semantic_error loc @@ "Invalid global variable \"" ^ id ^ "\" with compile-time incomplete type " ^ show_typ t ^ ".");
+  (* Check that the initialization has the correct value for the static variable *)
+  let check_init_type tv =
+    (match unify t tv with
+    | Some(utv) -> utv
+    | None -> Util.raise_semantic_error loc @@ "Trying to initialize a variable with type " ^ show_typ(t) ^ " with a value of type " ^ show_typ(tv.ann) ^ ".") in
+  Option.map (fun e -> check_init_type (check_global_value sym t e)) init
 
 (**
   Function that incapsulates the logic of checking the type of a boolean condition,
@@ -306,27 +400,26 @@ let check_condition loc t =
 (**
   Semantically check a statement.
   As a placeholder, the semantically annotated AST is annotated with the type void.
-  @param ret_found a ref variable; contains true iff a return statement has been found in the current function
   @param rt the return type of the function where this statement is
   @param sym the current symbol table
   @param stmt the statement expression
   @returns the semantically annotated AST for this statement (void)
   @throws Semantic_error if an error occurs
 *)
-let rec check_stmt ret_found rt sym stmt = annotate TypV @@
+let rec check_stmt rt sym stmt = annotate TypV @@
   (match stmt.node with
   | If(e, s1, s2) ->
     let et  = e |> check_expr sym |> check_condition e.ann in
-    let s1t = check_stmt ret_found rt sym s1 in
-    let s2t = check_stmt ret_found rt sym s2 in
+    let s1t = check_stmt  rt sym s1 in
+    let s2t = check_stmt  rt sym s2 in
     If(et, s1t, s2t)
   | While(e, b) ->
     let et = e |> check_expr sym |> check_condition e.ann in
-    let st = check_stmt ret_found rt sym b in
+    let st = check_stmt  rt sym b in
     While(et, st)
   | DoWhile(b, e) ->
     let et = e |> check_expr sym |> check_condition e.ann in
-    let st = check_stmt ret_found rt sym b in
+    let st = check_stmt  rt sym b in
     DoWhile(st, et)
   | Expr(e) -> Expr(check_expr sym e)
   | Return(None) ->
@@ -336,13 +429,12 @@ let rec check_stmt ret_found rt sym stmt = annotate TypV @@
   | Return(Some(e)) ->
     let et = check_expr sym e in
     (match unify rt et with
-      | Some(uet) -> ret_found := true; (* Globally update the return status as found *)
-                     Return(Some(et))
+      | Some(uet) -> Return(Some(et))
       | None      -> Util.raise_semantic_error e.ann @@ "Function returns " ^ show_typ(rt) ^ ", but returned value is of type " ^ show_typ(et.ann) ^ ".")
   | Block(e) ->
     (* Create a new symbol table by adding a block scope *)
     let block_sym = {sym with var_sym = Symbol_table.begin_block sym.var_sym} in
-    Block(List.map (check_stmtordecl ret_found rt block_sym) e))
+    Block(List.map (check_stmtordecl rt block_sym) e))
 
 (**
   Semantically check a statement or a declaration, contained inside a block.
@@ -354,15 +446,29 @@ let rec check_stmt ret_found rt sym stmt = annotate TypV @@
   @returns the semantically annotated AST for this statement (void)
   @throws Semantic_error if an error occurs
 *)
-and check_stmtordecl ret_found rt sym b = annotate TypV @@
+and check_stmtordecl rt sym b = annotate TypV @@
   (match b.node with
-  | Dec(t, id) -> check_vardecl b.ann sym (t, id) |> ignore;
-                  Dec(t, id)
-  | Stmt(s) -> Stmt(check_stmt ret_found rt sym s))
+  (* There is no initializer; simply check the variable declaration. *)
+  | Dec(t, id, None) -> check_vardecl b.ann sym (t, id);
+                        Dec(t, id, None)
+  | Dec(t, id, Some(e)) ->
+    check_vardecl b.ann sym (t, id);
+    let et = check_expr sym e in
+    (* Ensure that the declared variable type corresponds with the value assigned.
+       Note that here we do not check that the assignment is a valid "semantic"
+       assignment in the same way that it is checked in check_expr and Assign.
+       For example, here we can introduce string literals, whereas if we desugared it
+       into an assignment, we would get "Cannot reassign to array" because strings
+       are just arrays. *)
+    (match unify t et with
+      | Some(uet) -> Dec(t, id, Some(uet))
+      | None -> Util.raise_semantic_error b.ann @@ "Trying to initialize a local variable with type " ^ show_typ(t) ^ " with a value of type " ^ show_typ(et.ann) ^ ".")
+  | Stmt(s) -> Stmt(check_stmt rt sym s))
 
 (**
   Semantically check a function declaration.
   This function acts as starting point for the main check_stmt (and then check_expr) functions.
+  Furthermore, transform the function arguments into their implementation types.
   @param loc the location to report the error to if an error occurs
   @param sym the current symbol table
   @param f the fundecl being currently checked
@@ -370,8 +476,13 @@ and check_stmtordecl ret_found rt sym b = annotate TypV @@
   @throws Semantic_error if an error occurs
 *)
 let check_fundecl loc sym f : typ fundecl =
+  (* Convert the function arguments into their corresponding implementation types *)
+  let runtime_formals =
+     f.formals |> List.map (fun (t, i) -> (check_function_argument_type sym.struct_sym loc t, i)) in
+  (* Redefine f as the correctly converted runtime fundecl *)
+  let f = {f with formals = runtime_formals} in
   (* Check the return type as valid *)
-  check_function_return_type loc f.typ;
+  check_function_return_type sym.struct_sym loc f.typ;
   (* Pre-emptively insert the (incomplete) function definition inside the
      namespace for functions, in order to allow for recursive definitions *)
   let self_fun_sym =
@@ -379,17 +490,49 @@ let check_fundecl loc sym f : typ fundecl =
     with Symbol_table.DuplicateEntry ->
       Util.raise_semantic_error loc @@ "Function " ^ f.fname ^ " already declared." in
   (* Initialize a new scoping block inside the function *)
-  let function_var_sym = Symbol_table.begin_block sym.var_sym in
-  let empty_function_sym = {fun_sym = self_fun_sym; var_sym = function_var_sym} in
+  let function_sym = { fun_sym    = self_fun_sym
+                     ; var_sym    = Symbol_table.begin_block sym.var_sym
+                     ; struct_sym = sym.struct_sym
+                     } in
   (* Insert all parameters as variable declarations in the new namespace *)
-  let function_sym = List.fold_left (check_vardecl loc) empty_function_sym f.formals in
-  let ret_found = ref false in
-  let function_body = check_stmt ret_found f.typ function_sym f.body in
-  (* Finally check that the return statement has been found, if required *)
-  (match (f.typ, !ret_found) with
-    | (TypV, _    )
-    | (_,    true ) -> {f with body = function_body}
-    | (_,    false) -> Util.raise_semantic_error f.body.ann @@ "Missing return statement in non-void function \"" ^ f.fname ^ "\".")
+  List.iter (check_vardecl loc function_sym) f.formals;
+  let function_body = check_stmt f.typ function_sym f.body in
+  {f with body = function_body}
+
+(**
+  Semantically check a field variable declaration in a struct.
+  Variables inside structs are special because their type needs to
+  have a compile-time known fixed size.
+  @param loc the location to report the error to if an error occurs
+  @param struct_sym the current struct symbol table
+  @throws Semantic_error if an error occurs
+*)
+let check_field loc sym (t, id) =
+  check_var_type sym.struct_sym loc t;
+  (if not (is_complete_type t) then
+      Util.raise_semantic_error loc @@ "Invalid struct member \"" ^ id ^ "\" with compile-time incomplete type " ^ show_typ t ^ ".");
+  try  Symbol_table.add_entry id (loc, t) sym.var_sym |> ignore
+  with Symbol_table.DuplicateEntry ->
+    Util.raise_semantic_error loc "Variable already declared in the struct."
+
+(**
+  Semantically check a struct declaration.
+  @param sym the current symbol table
+  @param name the declared name of the struct
+  @param s the list of types and variables being declared in the struct
+  @throws Semantic_error if an error occurs
+*)
+let check_structdecl loc sym (name, s) =
+  (* Declare a new symbol-table struct scope to check for variable duplication;
+  this struct-local will be inserted as information for the struct in the symbol table. *)
+  let struct_sym = {sym with var_sym = Symbol_table.empty_table () } in
+  (* Check that all fields of the struct are all size-defined types and are not duplicated.*)
+  List.iter (check_field loc struct_sym) s;
+  try
+    (* Insert the currently created struct scope in the symbol-table *)
+    Symbol_table.add_entry name struct_sym.var_sym struct_sym.struct_sym |> ignore
+  with Symbol_table.DuplicateEntry ->
+    Util.raise_semantic_error loc @@ "Struct " ^ name ^ " already declared."
 
 (**
   Semantically check a top-level declaration.
@@ -400,9 +543,11 @@ let check_fundecl loc sym f : typ fundecl =
 *)
 let check_topdecl sym topdecl : typ topdecl = annotate TypV @@
   (match topdecl.node with
-  | Fundecl(f)    -> Fundecl(check_fundecl topdecl.ann sym f)
-  | Vardecl(t, i) -> check_vardecl topdecl.ann sym (t, i) |> ignore;
-                     Vardecl(t, i))
+  | Fundecl(f)          -> Fundecl(check_fundecl topdecl.ann sym f)
+  | Vardecl(t, i, init) -> let cinit = check_global_vardecl topdecl.ann sym (t, i) init in
+                           Vardecl(t, i, cinit)
+  | Structdecl(n, s)    -> check_structdecl topdecl.ann sym (n, s);
+                           Structdecl(n, s))
 
 (**
   Incapsulate the logic of checking for whole-program properties
@@ -415,6 +560,7 @@ let check_topdecl sym topdecl : typ topdecl = annotate TypV @@
 *)
 let check_program sym p =
   match Symbol_table.lookup main_name sym.fun_sym with
+  (* Check for the correct signatures of the main procedure *)
   | Some(Fundef({typ = TypI; fname = main_name; formals = []})) -> p
   | Some(Fundef({typ = TypV; fname = main_name; formals = []})) -> p
   | Some(Fundef(f)) -> Util.raise_semantic_error f.body.ann "Invalid signature for main."
@@ -428,8 +574,10 @@ let check_program sym p =
 *)
 let builtin_functions_sym =
   let b = Symbol_table.empty_table () in
-  let _ = Symbol_table.add_entry "print"   (Builtin(TypV, [TypI])) b in
-  let _ = Symbol_table.add_entry "readint" (Builtin(TypI, []))     b in b
+  let decl_builtin (n, r, a) =
+    Symbol_table.add_entry n (Builtin(r, a)) b |> ignore in
+  List.iter decl_builtin Builtins.builtin_functions;
+  b
 
 (**
   Check the position-annotated AST of the given program.
@@ -438,8 +586,9 @@ let builtin_functions_sym =
 *)
 let check ((Prog(topdecls)) : position program) : typ program =
   (* Define the initial symbol-table environment *)
-  let global_sym = { fun_sym = builtin_functions_sym
-                   ; var_sym = Symbol_table.empty_table ()
+  let global_sym = { fun_sym    = builtin_functions_sym
+                   ; var_sym    = Symbol_table.empty_table ()
+                   ; struct_sym = Symbol_table.empty_table ()
                    } in
   (Prog(List.map (check_topdecl global_sym) topdecls))
     (* Now that the program has been locally check, check global properties *)

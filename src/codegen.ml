@@ -24,6 +24,25 @@ let llvm_false = L.const_int bool_type 0
 let llvm_true  = L.const_int bool_type 1
 
 (**
+  Information kept in the codegen symbol table for structures.
+  It provides the lltype associated with the struct and the information
+  contained in the struct declaration (i.e.: the field names and their types.)
+  We keep a list in order to lookup the element index, later used in gep accesses.
+*)
+type struct_info = L.lltype * (identifier * L.lltype) list
+
+(**
+  The main scoped symbol table carried around during codegen.
+  Contains the namespaces for functions and variables, and associates
+  to each name either the function definition llvalue
+  or the llvalue associated with the variable.
+*)
+type sym = { fun_sym    : L.llvalue   Symbol_table.t
+           ; var_sym    : L.llvalue   Symbol_table.t
+           ; struct_sym : struct_info Symbol_table.t
+           }
+
+(**
   Function incapsulating the logic of implementing binary operators,
   associating each operator and the types of its operands with the
   LLVM instruction that constructs and implements it.
@@ -61,7 +80,12 @@ let binary_operator = function
   | (Ge,    (TypF, TypF)) -> L.build_fcmp L.Fcmp.Oge
   | (Eq,    (TypF, TypF)) -> L.build_fcmp L.Fcmp.Oeq
   | (Neq,   (TypF, TypF)) -> L.build_fcmp L.Fcmp.One
+  (* Operations with characters: for now, only equality is allowed *)
+  | (Eq,    (TypC, TypC)) -> L.build_icmp L.Icmp.Eq
+  | (Neq,   (TypC, TypC)) -> L.build_icmp L.Icmp.Ne
+  (* Comma operator, reserved for future definitions of the operator *)
   | (Comma, (_,    _))    -> (fun a b _ _ -> b)
+  (* Otherwise, invalid *)
   | _ -> Util.raise_codegen_error "Invalid types with binary operator"
 
 (**
@@ -114,52 +138,79 @@ let boolean_operations_quit_conditions = function
   | Or  -> (llvm_true,  L.Icmp.Ne)
   | _   -> Util.raise_codegen_error "Invalid boolean operator."
 
-(** Translate a MicroC type into a concrete LLVM implementation type *)
-let rec lltype_of_typ = function
+(**
+  Function translating a MicroC type into a concrete LLVM implementation type.
+  @param struct_sym the symbol-table containing struct definitions
+  @param the type to be translated
+  @throws Codegen_error if an invalid non-existent struct is given.
+          This should theoretically never happen, as the structs are already
+          semantically and scope checked.
+*)
+let rec lltype_of_typ struct_sym = function
   | TypI             -> int_type
   | TypB             -> bool_type
   | TypC             -> char_type
   | TypF             -> float_type
-  | TypA(t, Some(s)) -> L.array_type (lltype_of_typ t) s
+  | TypA(t, Some(s)) -> L.array_type (lltype_of_typ struct_sym t) s
   | TypA(t, None)      (* Unbounded arrays are for all purposes considered as pointers;
                           clang and other tools compiling C to LLVM also do this *)
-  | TypP(t)          -> L.pointer_type (lltype_of_typ t)
+  | TypP(t)          -> L.pointer_type (lltype_of_typ struct_sym t)
   | TypV             -> void_type
+  | TypS(name)       ->
+    (match Symbol_table.lookup name struct_sym with
+    | None -> Util.raise_codegen_error @@ "Undefined struct \"" ^ name ^ "\"."
+    | Some(t, _) -> t)
 
 (**
-  Use the given builder to add a terminating instructor to a block if and
-  only if another one does not exist already. Else, simply do nothing.
-  This helper function is necessary in order not to insert additional terminating
-  instructions to a block that already terminates (e.g.: using an early return)
+  Use the given builder to add a terminating instruction to a block iff
+  another terminating instruction does not already exist at the end.
+  Else, simply do nothing. This helper function is necessary in order
+  not to insert additional terminating instructions to blocks that
+  already terminate (e.g.: using an early return)
   @param builder the builder used to insert the terminator given
   @param f the function to which the builder is passed to
 *)
 let add_terminator builder f =
+  (* Get the block terminator of the builder given, if present *)
   match L.block_terminator (L.insertion_block builder) with
     | Some(_) -> ()
     | None    -> f builder |> ignore
 
 (**
-  The main symbol table scope carried around during codegen.
-  Contains the namespaces for functions and variables, and associates
-  to each name either the function definition llvalue
-  or the llvalue associated with the variable.
-*)
-type sym = { fun_sym : L.llvalue Symbol_table.t
-           ; var_sym : L.llvalue Symbol_table.t
-           }
+  Cast the given address into a pointer, if required.
+  For example, this is necessary in the case where a sized
+  array is given to a function that expects an unsized
+  array (or, in the future, a pointer casted from the array.)
+  @param et the expected type of the access expression
+  @param at the actual   type of the access expression
+  @param var the address given by the access
+  @param builder the current builder used to write instructions
+  @return an llvalue with the expected semantic type
+ *)
+let unify_access et at var builder =
+  (match (et, at) with
+  (* Unsized arrays are already pointers; simply return their memory *)
+  | (TypA(_, None),    TypA(_, None))    -> var
+  (* A sized array is expected, simply return the memory address as-is *)
+  | (TypA(_, Some(_)), TypA(_, Some(_))) -> var
+  (* An unsized array is expected, so obtain the initial pointer to the sized array *)
+  | (TypA(_, None),    TypA(_, Some(_))) -> L.build_gep var [| llvm_zero; llvm_zero |] "" builder
+  (* Standard case: load the value from the access address *)
+  | _                                    -> L.build_load var "" builder)
 
 (**
-  Generate the LLVM code for a semantically annotated access AST node.
+  Generate the LLVM code for a semantically annotated access AST node,
+  returning *only* the address that the access expression entails, and not
+  its value.
   @param block_maker a closure to create new blocks in the current function
+  @param sym the variable symbol table for the current scope
   @param builder the builder used to generate the instructions; if the function
          requires it, it might be modified to point to another newly created block
-  @param sym the variable symbol table for the current scope
   @param a the access node
   @returns an llvalue that represents the *address* being accessed by this expression
   @throws Codegen_error if an error occurs
 *)
-let rec codegen_access block_maker builder sym a =
+let rec codegen_access block_maker sym builder a =
   match a.node with
   | AccVar(id) ->
     (match Symbol_table.lookup id (sym.var_sym) with
@@ -168,90 +219,118 @@ let rec codegen_access block_maker builder sym a =
   | AccDeref(e) ->
     (* Simply return the value given by the expression, since that
        will be the address; if needed, it will be dereferenced later *)
-    codegen_expr block_maker builder sym e
-  | AccIncr(a, p, i) ->
-    (* Simple function to pick the correct resulting llvalue
-       according to the given kind of operation *)
-    let pick_value before after = function
-      | Pre  -> before
-      | Post -> after in
-    (* Obtain the correct kind of instruction, according both
-       to the kind of operation and the operand type *)
-    let do_increment = increment_operator (i, a.ann) in
-    let var    = codegen_access block_maker builder sym a in
-    let before = L.build_load var        "" builder in
-    let after  = do_increment before     "" builder in
-    let _      = L.build_store var after    builder in
-    (* After the variable has been modified, pick the resulting value *)
-    pick_value before after p
+    codegen_expr block_maker sym builder e
   | AccIndex(a, i) ->
-    let var = codegen_access block_maker builder sym a in
-    let index = codegen_expr block_maker builder sym i in
-    (* Depending on the type of the reference, access it in different way: *)
+    let var = codegen_access block_maker sym builder a in
+    let index = codegen_expr block_maker sym builder i in
+    (* Depending on the type of the reference, access it in different ways: *)
     let indexing =
       (match a.ann with
-       (* Fixed-size array need to be dereferenced with an initial
-          zero-index to get through the pointer; *)
-       | TypA(_, Some(_)) -> [| llvm_zero; index |]
-       (* Arrays without fixed size on the other hand are
-          implemented as equivalent to pointers; simply dereference *)
-       | TypA(_, None)    -> [| index |]
-       | _                -> Util.raise_codegen_error "Invalid type annotation in indexing.") in
+      (* Fixed-size array need to be dereferenced with an initial
+         zero-index to get through the pointer; *)
+      | TypA(_, Some(_)) -> [| llvm_zero; index |]
+      (* Arrays without fixed size on the other hand are
+         implemented as equivalent to pointers; simply dereference *)
+      | TypA(_, None)    -> [| index |]
+      | _                -> Util.raise_codegen_error "Invalid type annotation in indexing.") in
     L.build_gep var indexing "" builder
+  | AccStruct(a, m) ->
+    let var = codegen_access block_maker sym builder a in
+    (* Get the field index corresponding to the requested variable.
+       (Ideally, we could refactor this section to monadically combine
+        these sequential steps with a >>= bind in a suitable monad.) *)
+    let field_index =
+      (* Get the struct name from the annotation. *)
+      (match a.ann with
+      | TypS(sname) ->
+        (* Get the struct information from the struct name *)
+        (match Symbol_table.lookup sname sym.struct_sym with
+        | Some(st, fields) ->
+          let names_to_indexes = List.mapi (fun i (v, _) -> (v, i)) fields in
+          (* Get the field index from the struct information *)
+          (match List.assoc_opt m names_to_indexes with
+          | Some(index) -> index
+          | None ->  Util.raise_codegen_error "Invalid undefined member in struct.")
+        | None -> Util.raise_codegen_error "Invalid undefined struct name.")
+      | _ -> Util.raise_codegen_error "Invalid non-struct type annotation in member access.") in
+    L.build_struct_gep var field_index "" builder
 
 (**
   Generate the LLVM code for a semantically annotated expr AST node.
   @param block_maker a closure to create new blocks in the current function
+  @param sym the variable symbol table for the current scope
   @param builder the builder used to generate the instructions; if the function
          requires it, it might be modified to point to another newly created block
-  @param sym the variable symbol table for the current scope
   @param e the expr node
   @returns an llvalue representing the value produced by the expression
   @throws Codegen_error if an error occurs
  *)
-and codegen_expr block_maker builder sym e =
+and codegen_expr block_maker sym builder e =
   match e.node with
   | ILiteral(i)  -> L.const_int int_type i
   | CLiteral(c)  -> L.const_int char_type (Char.code c)
   | BLiteral(b)  -> if b then llvm_true else llvm_false
   | FLiteral(f)  -> L.const_float float_type f
-  | SLiteral(s)  -> L.const_string llcontext s
-                    (* Use the annotation given by the semantic checking to
+  | SLiteral(s)  -> (* The literal given might be required to be cast to
+                       an unsized array, as it is done for standard arrays.
+                       L.build_global_string does not contain a null terminator, which we add.
+                       Note how this differs with the global string declaration,
+                       where instead the llvalue initializer L.const_string is used. *)
+                    let str = L.build_global_string (s ^ String.make 1 '\000') "" builder in
+                    unify_access e.ann (string_type s) str builder
+  | Null         -> (* Use the annotation given by the semantic checking to
                        define the polymorphic NULL type with the appropriate type *)
-  | Null         -> L.const_pointer_null (lltype_of_typ e.ann)
-                    (* Access expression already returns a pointer here, simply return the llvalue *)
-  | Addr(a)      -> codegen_access block_maker builder sym a
-  | Access(a)    ->
-    let var = codegen_access block_maker builder sym a in
-    (match (e.ann, a.ann) with
-     | (TypA(_, None), TypA(_, None))    -> var
-     | (TypA(_, None), TypA(_, Some(_))) -> L.build_gep var [| llvm_zero; llvm_zero |] "" builder
-     | _                                 -> L.build_load var "" builder )
+                    L.const_pointer_null (lltype_of_typ sym.struct_sym e.ann)
+  | Addr(a)      -> (* Access expression already returns a pointer here, simply return the llvalue *)
+                    codegen_access block_maker sym builder a
+  | Increment(a, p, i) ->
+    (* Simple function to pick the correct resulting llvalue
+       according to the given kind of operation *)
+    let pick_value before after = function
+      | Pre  -> after
+      | Post -> before in
+    (* Obtain the correct kind of instruction, according both
+       to the kind of operation and the operand type *)
+    let do_increment = increment_operator (i, a.ann) in
+    (* Start the concrete sequential codegen section: *)
+    let var    = codegen_access block_maker sym builder a in
+    let before = L.build_load var     "" builder in
+    let after  = do_increment before  "" builder in
+    let _      = L.build_store after var builder in
+    (* After the variable has been modified, pick the resulting value *)
+    pick_value before after p
+  | Access(a) ->
+    (* Obtain the address and extract its value. *)
+    let var = codegen_access block_maker sym builder a in
+    (* Unify the given address if necessary, using as expected type the
+       type of this expression and the access type. *)
+    unify_access e.ann a.ann var builder
   | Assign(a, e) ->
-    let p = codegen_access block_maker builder sym a in
-    let v = codegen_expr   block_maker builder sym e in
+    let var   = codegen_access block_maker sym builder a in
+    let value = codegen_expr   block_maker sym builder e in
     (* All access operations return an address, so a final store is required *)
-    L.build_store v p builder |> ignore;
-    v
+    L.build_store value var builder |> ignore;
+    value
   | AssignOp(a, op, b) ->
     (* Codegen the access, so that pre/post-increment operations will
        only be executed once. This is the reason why this expression is not
        desugared and instead treated here as an independent case. *)
-    let p = codegen_access block_maker builder sym a in
-    let a_maker = fun builder -> p in
-    let b_maker = fun builder -> codegen_expr block_maker builder sym b in
-    let v = build_binary_operator op block_maker a_maker b_maker builder (a.ann, b.ann) in
+    let var = codegen_access block_maker sym builder a in
+    (* The left value requires a load, since var is an address coming from access. *)
+    let a_maker = fun builder -> L.build_load var "" builder in
+    let b_maker = fun builder -> codegen_expr block_maker sym builder b in
+    let value   = build_binary_operator op block_maker a_maker b_maker builder (a.ann, b.ann) in
     (* Finally, store the variable back as it would be done in an assignment expression *)
-    L.build_store v p builder |> ignore;
+    L.build_store value var builder |> ignore;
     (* This expression evaluates to the assigned value, so return it *)
-    v
+    value
   | UnaryOp(uop, e) ->
-    let ev = codegen_expr block_maker builder sym e in
+    let ev = codegen_expr block_maker sym builder e in
     unary_operator (uop, e.ann) ev "" builder
   | BinaryOp(op, a, b) ->
     (* Define the two lazy building closures for the subexpression *)
-    let a_maker = fun builder -> codegen_expr block_maker builder sym a in
-    let b_maker = fun builder -> codegen_expr block_maker builder sym b in
+    let a_maker = fun builder -> codegen_expr block_maker sym builder a in
+    let b_maker = fun builder -> codegen_expr block_maker sym builder b in
     build_binary_operator op block_maker a_maker b_maker builder (a.ann, b.ann)
   | Call(f, args) ->
     let fundef =
@@ -260,7 +339,7 @@ and codegen_expr block_maker builder sym e =
         | None    -> Util.raise_codegen_error @@ "Undefined function \"" ^ f ^ "\".") in
     (* Sequentially generate (in a left-to-right evaluation order, as given by List.map)
        the concrete function call arguments *)
-    let actuals = List.map (codegen_expr block_maker builder sym) args in
+    let actuals = List.map (codegen_expr block_maker sym builder) args in
     L.build_call fundef (Array.of_list actuals) "" builder
 
 (**
@@ -283,7 +362,7 @@ and build_binary_operator op block_maker a_maker b_maker builder types =
     let bv = b_maker builder in
     instr av bv "" builder
   in match types with
-  | (TypB, TypB) -> codegen_boolean_op op block_maker a_maker b_maker builder
+  | (TypB, TypB) -> build_boolean_operator op block_maker a_maker b_maker builder
                     (* Obtain the concrete instruction operation for the given expression,
                        and simply generate both expression using their maker closures *)
   | _            -> strict_block_sequence (binary_operator (op, types))
@@ -299,7 +378,7 @@ and build_binary_operator op block_maker a_maker b_maker builder types =
   @returns an llvalue representing the value produced by the expression
   @throws Codegen_error if an error occurs
  *)
-and codegen_boolean_op op block_maker a_maker b_maker builder =
+and build_boolean_operator op block_maker a_maker b_maker builder =
   let (quit_value, quit_comparison) = boolean_operations_quit_conditions op in
 
   let left_block    = block_maker "left"   in
@@ -335,31 +414,65 @@ and codegen_boolean_op op block_maker a_maker b_maker builder =
 (* Global/local variables and parameters definition section *)
 
 (* Default variable initializer; exploit the Llvm.undef utility to give the same semantics as C. *)
-let var_initializer t = L.undef (lltype_of_typ t)
+let var_initializer struct_sym t = L.undef (lltype_of_typ struct_sym t)
+
+(* Codegen a global variable initializer for the compile-time constant expression.
+   This function might in the future encapsulate and allocate values differently
+   compared to codegen_expr, since here we generate initializers for a static storage. *)
+let expr_initializer sym e = match e.node with
+  | ILiteral(i)  -> L.const_int int_type i
+  | CLiteral(c)  -> L.const_int char_type (Char.code c)
+  | BLiteral(b)  -> if b then llvm_true else llvm_false
+  | FLiteral(f)  -> L.const_float float_type f
+  | SLiteral(s)  -> (* Here we give a string literal initializer, with a
+                       null-terminator as indicated by the ending "z"; note how in
+                       the standard codegen we generate a L.build_global_string instead. *)
+                    L.const_stringz llcontext s
+  | Null         -> L.const_pointer_null (lltype_of_typ sym.struct_sym e.ann)
+  | _ -> Util.raise_codegen_error @@ "Invalid non-constant global initializer."
 
 (* Codegen a global variable declaration. *)
-let codegen_global llmodule sym (t, id) =
-  let var = L.define_global id (var_initializer t) llmodule in
+let codegen_global llmodule sym (t, id) init =
+  (* Obtain the initializer expression for the global variable.
+     If there is no constant initializer, then use the default initializer for the
+     type being declared. Otherwise, codegen the llvalue of the constant expression. *)
+  let global_init =
+    Option.fold ~none:(var_initializer sym.struct_sym t)
+                ~some:(expr_initializer sym) init in
+  let var = L.define_global id global_init llmodule in
   let _ = Symbol_table.add_entry id var sym.var_sym in ()
 
-(* Codegen a standard variable declaration. *)
-let codegen_vardecl builder sym (t, id) =
-  let local = L.build_alloca (lltype_of_typ t) "" builder in
+(* Codegen a standard local variable declaration, with optional initializer. *)
+let codegen_local_vardecl sym builder block_maker (t, id, opt_e) =
+  let var = L.build_alloca (lltype_of_typ sym.struct_sym t) "" builder in
+  (* Helper function to generate a initialized local variable, if it is
+     initialized. Special cases are required when the given value is an array. *)
+  let get_initialized_var e =
+      let ev = codegen_expr block_maker sym builder e in
+      (match t with
+        (* If we are considering an array variable, then
+           the variable simply aliases the given array;
+           return it as-is, without allocating any more memory. *)
+        | TypA(_, _) -> ev
+        (* Else, store (i.e.: copy) the value in the variable. *)
+        | _          -> L.build_store ev var builder |> ignore; var) in
+  (* If the initializer is not given, simply give the allocated variable. *)
+  let local = Option.fold ~none:var ~some:get_initialized_var opt_e in
   let _ = Symbol_table.add_entry id local sym.var_sym in local
 
-(* Codegen the declaration of a parameter variable, in the function body. *)
-let codegen_local_param builder sym (t, id) param =
+(* Codegen the declaration of a parameter variable, inside the function body. *)
+let codegen_local_param sym builder (t, id) param =
   match t with
     | TypA(_, _) ->
-      (* If the type in question is a direct array, we do not need to allocate the
+      (* If the type considered is a direct array, we do not need to allocate the
          variable space for the array, and we directly use the pointer passed as llvalue.
          This is also part of the implicit reason why it is easier to assume that arrays
-         cannot be reassigned.*)
+         cannot be reassigned. *)
       Symbol_table.add_entry id param sym.var_sym |> ignore
     | _ ->
       (* Else, first allocate the value, store the parameter in it and then insert the
           allocated space as llvalue in the symbol table.  *)
-      let local = L.build_alloca (lltype_of_typ t) "" builder in
+      let local = L.build_alloca (lltype_of_typ sym.struct_sym t) "" builder in
       Symbol_table.add_entry id local sym.var_sym |> ignore;
       L.build_store param local builder           |> ignore
 
@@ -373,10 +486,10 @@ let codegen_local_param builder sym (t, id) param =
   @returns true iff this expression does not interrupt the codegen flow of the next instructions
   @throws Codegen_error if an error occurs
  *)
-let rec codegen_stmtordec fundef sym builder s =
+let rec codegen_stmtordec fundef sym block_maker builder s =
   match s.node with
-  | Dec(t, id) -> codegen_vardecl builder sym (t, id) |> ignore; true
-  | Stmt(s)    -> codegen_stmt fundef sym builder s
+  | Dec(t, id, opt_e) -> codegen_local_vardecl sym builder block_maker (t, id, opt_e) |> ignore; true
+  | Stmt(s)           -> codegen_stmt fundef sym builder s
 
 (**
   Generate the LLVM code for a statement.
@@ -404,11 +517,11 @@ and codegen_stmt fundef sym builder stmt =
     add_terminator builder (L.build_br @@ choose_first_block test_block body_block) |> ignore;
 
     (* Codegen the test: first codegen the boolean expression, then branch according to it *)
-    let cond_val = codegen_expr block_maker test_builder sym cond in
+    let cond_val = codegen_expr block_maker sym test_builder cond in
     L.build_cond_br cond_val body_block cont_block test_builder |> ignore;
 
     (* Codgen the body; we try to branch to the test block if no terminator already exists *)
-    codegen_stmt fundef sym body_builder body  |> ignore;
+    codegen_stmt fundef sym body_builder body           |> ignore;
     add_terminator body_builder (L.build_br test_block) |> ignore;
 
     (* Update the initial builder given to point at the end of the cont_block *)
@@ -423,16 +536,18 @@ and codegen_stmt fundef sym builder stmt =
     let block_sym = {sym with var_sym = Symbol_table.begin_block sym.var_sym} in
     let fold_block_statement continue stmtordec =
       if continue then (* If we can continue, generate the next statement/declaration *)
-        codegen_stmtordec fundef block_sym builder stmtordec
+        codegen_stmtordec fundef block_sym block_maker builder stmtordec
       else
-        false (* Otherwise, make the entire block return false *)
+        false (* Otherwise, make the entire block return false.
+                 An additional check could be inserted here to signal the fact that
+                 if there are other statements they will never be executed/generated. *)
     (* Foldl each statement in the block, starting with true *)
     in List.fold_left fold_block_statement true b
-  | Expr(e) -> codegen_expr block_maker builder sym e |> ignore; true
+  | Expr(e) -> codegen_expr block_maker sym builder e |> ignore; true
   | Return(opt_e) ->
     (match opt_e with
      | None    -> add_terminator builder L.build_ret_void
-     | Some(e) -> let ret_expr = codegen_expr block_maker builder sym e in
+     | Some(e) -> let ret_expr = codegen_expr block_maker sym builder e in
                   add_terminator builder (L.build_ret ret_expr));
                   false (* Do not continue codegen to the subsequent statements *)
   | If(c, then_stmt, else_stmt) ->
@@ -443,7 +558,7 @@ and codegen_stmt fundef sym builder stmt =
     let else_builder = L.builder_at_end llcontext else_block in
 
     (* Immediately generate the condition and then branch to either block *)
-    let condition = codegen_expr block_maker builder sym c in
+    let condition = codegen_expr block_maker sym builder c in
     L.build_cond_br condition then_block else_block builder  |> ignore;
 
     (* Codegen the then_block *)
@@ -472,8 +587,8 @@ and codegen_stmt fundef sym builder stmt =
   @throws Codegen_error if an error occurs
  *)
 let codegen_fundecl llmodule sym f =
-  let return_type   = lltype_of_typ f.typ in
-  let formals_types = f.formals |> List.map fst |> List.map lltype_of_typ in
+  let return_type   = lltype_of_typ sym.struct_sym f.typ in
+  let formals_types = f.formals |> List.map fst |> List.map (lltype_of_typ sym.struct_sym) in
   let function_type = L.function_type return_type (Array.of_list formals_types) in
   let fundef        = L.define_function f.fname function_type llmodule in
   let self_sym      = {sym with fun_sym = Symbol_table.add_entry f.fname fundef sym.fun_sym} in
@@ -482,15 +597,34 @@ let codegen_fundecl llmodule sym f =
   let local_sym     = {self_sym with var_sym = Symbol_table.begin_block sym.var_sym} in
 
   (* First, declare the parameter variables *)
-  List.iter2 (codegen_local_param builder local_sym) f.formals parameters;
+  List.iter2 (codegen_local_param local_sym builder) f.formals parameters;
 
   (* Start the main code generation of the function *)
   codegen_stmt fundef local_sym builder f.body |> ignore;
 
-  (* Add an implicit return void terminator, if it is not already present *)
+  (* Add an implicit return terminator, if it is not already present.
+     According to C semantics, if a non-void returning function does not
+     explicitly return a value at the end of the function, then the returned
+     value is simply undefined. In a similar fashion, we simply return an
+     undefined value if the add_terminator function succeeds. *)
   match f.typ with
     | TypV -> add_terminator builder L.build_ret_void
-    | _ -> ()
+    | _    -> add_terminator builder (L.build_ret (L.undef return_type))
+
+(**
+  Generate the LLVM code for a struct declaration.
+  @param llmodule the current llmodule
+  @param sym the current symbol table
+  @param n the name of the struct
+  @param fs the fields of the struct, as a list of (type, identifier)
+  @param topdecl the AST node representing the declaration
+  @throws Codegen_error if an error occurs
+ *)
+let codegen_struct llmodule sym (n, fs) =
+  let typed_fields =
+    List.map (fun (t, v) -> (v, lltype_of_typ sym.struct_sym t)) fs in
+  let struct_type = L.struct_type llcontext (Array.of_list (List.map snd typed_fields)) in
+  Symbol_table.add_entry n (struct_type, typed_fields) sym.struct_sym |> ignore
 
 (**
   Generate the LLVM code for a top-level declaration.
@@ -501,14 +635,17 @@ let codegen_fundecl llmodule sym f =
  *)
 let codegen_topdecl llmodule sym topdecl =
   match topdecl.node with
-  | Fundecl(fundecl) -> codegen_fundecl llmodule sym fundecl
-  | Vardecl(t, id)   -> codegen_global  llmodule sym (t, id)
+  | Fundecl(fundecl)     -> codegen_fundecl llmodule sym fundecl
+  | Vardecl(t, id, init) -> codegen_global  llmodule sym (t, id) init
+  | Structdecl(n, fs)    -> codegen_struct  llmodule sym (n, fs)
 
 (* List of default base builtin functions to be declared *)
-let builtin_functions =
-  [ ("print",  L.function_type void_type [| int_type |])
-  ; ("getint", L.function_type int_type  [||]          )
-  ]
+let llvm_builtins sym =
+  Builtins.builtin_functions
+    |> List.map
+      (fun (id, r, a) ->
+        (id, L.function_type (lltype_of_typ sym.struct_sym r)
+                             (List.map (lltype_of_typ sym.struct_sym) a |> Array.of_list)))
 
 (* Globally declare a builtin function prototype *)
 let declare_builtin llmodule sym (name, lltype) =
@@ -524,9 +661,10 @@ let module_name = "microcc"
  *)
 let codegen (Prog(topdecls)) =
   let llmodule = L.create_module llcontext module_name in
-  let starting_sym = { fun_sym = Symbol_table.empty_table ()
-                     ; var_sym = Symbol_table.empty_table ()
+  let starting_sym = { fun_sym    = Symbol_table.empty_table ()
+                     ; var_sym    = Symbol_table.empty_table ()
+                     ; struct_sym = Symbol_table.empty_table ()
                      } in
-  List.iter (declare_builtin llmodule starting_sym) builtin_functions;
+  List.iter (declare_builtin llmodule starting_sym) (llvm_builtins starting_sym);
   List.iter (codegen_topdecl llmodule starting_sym) topdecls;
   llmodule

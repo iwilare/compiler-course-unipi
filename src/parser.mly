@@ -1,12 +1,13 @@
 /*
-* MicroC Parser specification
-*/
+ * MicroC Parser specification
+ */
 
 %{
 open Ast
+open Position
 %}
 
-/* Tokens declarations */
+/* Token declarations */
 
 %token EOF
 
@@ -17,6 +18,10 @@ open Ast
 %token INT "int" CHAR "char" BOOL "bool" FLOAT "float" VOID "void"
 
 %token NULL "NULL"
+
+%token STRUCT "struct"
+
+%token DOT "."
 
 %token LPAREN "(" RPAREN ")"
 
@@ -40,9 +45,9 @@ open Ast
 
 %token INCREMENT "++" DECREMENT "--"
 
-%token ASSIGNMENT_PLUS "+=" ASSIGNMENT_MINUS "-="
+%token ASSIGNMENT_PLUS  "+=" ASSIGNMENT_MINUS "-="
 %token ASSIGNMENT_TIMES "*=" ASSIGNMENT_DIVIDE "/="
-%token ASSIGNMENT_MOD "%="
+%token ASSIGNMENT_MOD   "%="
 
 %token PLUS "+" MINUS "-" TIMES "*" DIVIDE "/" MOD "%"
 
@@ -56,6 +61,7 @@ open Ast
 
 /* Precedence and associativity specification */
 
+/* %left  "," (unnecessary precedence) */
 %right    "=" "+=" "-=" "*=" "/=" "%="
 %left     "||"
 %left     "&&"
@@ -64,7 +70,8 @@ open Ast
 %left     "+" "-"
 %left     "*" "/" "%"
 %right    "!" "&"
-%left     "++" "--"
+%left     "."
+/* %left  "++" "--" (unnecessary precedence) */
 %nonassoc "["
 
 /* Resolve the dangling else problem by giving
@@ -74,22 +81,22 @@ open Ast
 %nonassoc without_else
 %nonassoc ELSE
 
-/* Starting symbol */
+/* Starting symbol: the parser returns a position-annotated Ast.program. */
 
-%start <position program> program /* the parser returns a Ast.program value */
+%start <position program> program
 
 %%
 
 /* A helper Menhir function to directly annotate expressions with their position */
 %inline annotate(X):
-   | x=X { x |> annotate_pos $loc }
+   | x=X { annotate $loc x }
 
 /* Other useful Menhir functions to simplify parsing */
 %inline parens(X):
    | x=delimited("(", X, ")") { x }
 %inline parentify(X):
-   | x=delimited("(", X, ")") { x }
-   | x=X                      { x }
+   | x=parens(X) { x }
+   | x=X         { x }
 
 /* Grammar specification */
 
@@ -102,14 +109,20 @@ program:
 
 topdecl: x=annotate(topdecl_) { x }
 topdecl_:
-  | f=fundecl     { Fundecl(f) }
-  | v=vardecl ";" { Vardecl(fst v, snd v) }
+  | f=fundecl
+    { Fundecl(f) }
+  | v=vardecl init=option(preceded("=", expr)) ";"
+    /* The value assigned to the global variable must be a constant.
+       This will be enforced at the semantic analysis step. */
+    { Vardecl(fst v, snd v, init) }
+  | s=structdecl
+    { Structdecl(fst s, snd s) }
 
 /* Simply apply the function provided to vardesc to the inner type. */
 vardecl:
   | t=typ v=vardesc { v t }
 
-/* We discovered here a somewhat elegant approach to defer as much as possible
+/* We found here a somewhat elegant approach to defer as much as possible
    the definition of the innermost concrete type, which is provided by
    vardecl and not by vardesc. For this reason, vardesc returns
    a function which only successively expects the innermost type.
@@ -123,24 +136,33 @@ vardesc:
   | v=vardesc "[" i=option(INTEGER) "]" { fun t -> v (TypA(t, i)) }
 
 typ:
-  | "int"   { TypI }
-  | "bool"  { TypB }
-  | "char"  { TypC }
-  | "float" { TypF }
-  | "void"  { TypV }
+  | "int"          { TypI     }
+  | "bool"         { TypB     }
+  | "char"         { TypC     }
+  | "float"        { TypF     }
+  | "void"         { TypV     }
+  | "struct" id=ID { TypS(id) }
 
 fundecl:
   | t=typ i=ID "(" p=separated_list(",", vardecl) ")" b=block
     { {typ=t; fname=i; formals=p; body=b } }
 
+structdecl:
+  | "struct" name=ID "{" s=list(terminated(vardecl, ";")) "}"
+    { (name, s) }
+
 block: x=annotate(block_) { x }
 block_:
   | "{" s=list(stmtordec) "}" { Block(s) }
 
-stmtordec: x=annotate(stmtordec_) { x }
+stmtordec: xs=annotate(stmtordec_) { xs}
 stmtordec_:
-  | s=stmt        { Stmt(s)           }
-  | v=vardecl ";" { Dec(fst v, snd v) }
+  | s=stmt
+    { Stmt(s) }
+  | v=vardecl ";"
+    { Dec(fst v, snd v, None) }
+  | v=vardecl "=" e=expr ";"
+    { Dec(fst v, snd v, Some(e)) }
 
 stmt:
   | x=annotate(stmt_) { x }
@@ -152,7 +174,7 @@ stmt_:
     { Expr(e) }
   | "while" "(" e=expr ")" b=stmt
     { While(e, b) }
-  | "do" b=stmt "while" "(" e=expr ")"
+  | "do" b=stmt "while" "(" e=expr ")" ";"
     /* DoWhile is considered as a first-class AST node and it is NOT desugared. */
     { DoWhile(b, e) }
   | "for" "(" x=option(expr) ";" y=option(expr) ";" z=option(expr) ")" b=stmt
@@ -172,23 +194,23 @@ stmt_:
                }
          }
       */
-    { let expr_to_stmt  e = annotate_pos e.ann @@ Expr(e) in
-      let stmt_in_block e = annotate_pos e.ann @@ Stmt(e) in
+    { let expr_to_stmt  e = annotate e.ann @@ Expr(e) in
+      let stmt_in_block e = annotate e.ann @@ Stmt(e) in
       let expr_in_block e = stmt_in_block (expr_to_stmt e) in
       let init = Option.to_list @@ Option.map expr_in_block x in
-      let default_condition = annotate_pos $loc @@ BLiteral(true) in
+      let default_condition = annotate $loc @@ BLiteral(true) in
       let cond = Option.value y ~default:default_condition in
       let incr = Option.to_list @@ Option.map expr_in_block z in
         Block(init
-            @ [stmt_in_block       @@
-               annotate_pos $loc  @@ While(cond,
-               annotate_pos b.ann @@ Block(stmt_in_block b :: incr))]) }
+            @ [stmt_in_block  @@
+               annotate $loc  @@ While(cond,
+               annotate b.ann @@ Block(stmt_in_block b :: incr))]) }
   | "if" "(" b=expr ")" e1=stmt "else" e2=stmt
     { If(b, e1, e2) }
   | "if" "(" b=expr ")" e=stmt %prec without_else
-    /* Apply the if-without-else precedence and use an empty block as
-       missing else statement. */
-    { If(b, e, annotate_pos dummy_pos @@ Block([])) }
+    /* Apply the if-without-else precedence and use
+       an empty block as missing else statement. */
+    { If(b, e, annotate dummy_pos @@ Block([])) }
 
 %inline OP:
   | "+"  { Add   }
@@ -216,9 +238,13 @@ stmt_:
   | "/=" { Div }
   | "%=" { Mod }
 
+/* Expressions are the sum of right and left expressions */
+
 expr:
   | r=rexpr            { r }
-  | l=lexpr            { Access(l) |> annotate_pos $loc }
+  | l=lexpr            { Access(l) |> annotate $loc }
+
+/* rvalues, cannot appear on the left on an assignment */
 
 rexpr:
   | x=aexpr            { x }
@@ -230,8 +256,15 @@ rexpr_:
   | l=lexpr op=ASSIGNMENT_OP r=expr
     /* AssignmentOps are considered as a first-class AST node and are NOT desugared. */
     { AssignOp(l, op, r) }
-  | uop=UOP e=expr        { UnaryOp(uop, e)      }
-  | e1=expr op=OP e2=expr { BinaryOp(op, e1, e2) }
+  | uop=UOP e=expr        { UnaryOp(uop, e)          }
+  | e1=expr op=OP e2=expr { BinaryOp(op, e1, e2)     }
+  /* Increments are considered as first-class AST nodes and are NOT desugared. */
+  | "++" a=lexpr          { Increment(a, Pre,  Incr) }
+  | "--" a=lexpr          { Increment(a, Pre,  Decr) }
+  | a=lexpr "++"          { Increment(a, Post, Incr) }
+  | a=lexpr "--"          { Increment(a, Post, Decr) }
+
+/* Atomic expressions */
 
 aexpr:
   | x=parens(rexpr)    { x }
@@ -246,14 +279,12 @@ aexpr_:
   | "NULL"      { Null            }
   | "&" a=lexpr { Addr(a)         }
 
+/* lvalues, can appear on the left of an assignment */
+
 lexpr: x=annotate(parentify(lexpr_)) { x }
 lexpr_:
-  /* Increments are considered as first-class AST nodes and are NOT desugared. */
-  | "++" a=lexpr           { AccIncr(a, Pre,  Incr)                     }
-  | "--" a=lexpr           { AccIncr(a, Pre,  Decr)                     }
-  | a=lexpr "++"           { AccIncr(a, Post, Incr)                     }
-  | a=lexpr "--"           { AccIncr(a, Post, Decr)                     }
+  | a=lexpr "." m=ID       { AccStruct(a, m)                            }
   | i=ID                   { AccVar(i)                                  }
   | "*" a=aexpr            { AccDeref(a)                                }
-  | "*" a=lexpr            { AccDeref(Access(a) |> annotate_pos a.ann)  }
+  | "*" a=lexpr            { AccDeref(Access(a) |> annotate a.ann)  }
   | v=lexpr "[" i=expr "]" { AccIndex(v, i)                             }

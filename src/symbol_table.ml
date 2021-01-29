@@ -32,8 +32,8 @@ let rec lookup symbol table =
 (* Directly define a variable in the current scope, modifying the
    first scope and inserting the variable data in the first hash table.
    Throw DuplicateEntry if a variable is declared in the exact same scope.
-   Note that since we not query upper scope, a variable can shadow*one in
-   the previous scope. *)
+   Note that since we do not query upper scopes, a variable in a scope
+   can shadow one in the previous scope. *)
 let add_entry symbol info table =
     let current = List.hd table in
     match Hashtbl.find_opt current symbol with

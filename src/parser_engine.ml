@@ -1,5 +1,10 @@
 module I = Parser.MenhirInterpreter
 
+(* Use the incremental API to provide a simple yet effective and precise
+   error signalling within the parser. This basically reimplements and
+   slightly overrides the loop already provided within the
+   Menhir API using the Parser.MenhirInterpreter.loop_handle helper. *)
+
 let fail lexbuf checkpoint =
   Util.raise_syntax_error lexbuf @@ "syntax error at lexeme \"" ^ Lexing.lexeme lexbuf ^ "\"."
 
