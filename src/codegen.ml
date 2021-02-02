@@ -80,9 +80,18 @@ let binary_operator = function
   | (Ge,    (TypF, TypF)) -> L.build_fcmp L.Fcmp.Oge
   | (Eq,    (TypF, TypF)) -> L.build_fcmp L.Fcmp.Oeq
   | (Neq,   (TypF, TypF)) -> L.build_fcmp L.Fcmp.One
+  (* Operations with pointers: for now only equality is supported *)
+  | (Eq,    (TypP(_), TypP(_))) -> L.build_icmp L.Icmp.Eq
+  | (Neq,   (TypP(_), TypP(_))) -> L.build_icmp L.Icmp.Ne
   (* Operations with characters: for now, only equality is allowed *)
   | (Eq,    (TypC, TypC)) -> L.build_icmp L.Icmp.Eq
   | (Neq,   (TypC, TypC)) -> L.build_icmp L.Icmp.Ne
+  (* Binary boolean operators: these versions do not provide short-circuiting *)
+  | (And,   (TypB, TypB)) -> L.build_and
+  | (Or,    (TypB, TypB)) -> L.build_or
+  (* Operations with booleans: for now, only equality is allowed *)
+  | (Eq,    (TypB, TypB)) -> L.build_icmp L.Icmp.Eq
+  | (Neq,   (TypB, TypB)) -> L.build_icmp L.Icmp.Ne
   (* Comma operator, reserved for future definitions of the operator *)
   | (Comma, (_,    _))    -> (fun a b _ _ -> b)
   (* Otherwise, invalid *)
@@ -102,6 +111,65 @@ let unary_operator = function
   | (Neg, TypF) -> L.build_fneg
   | (Not, TypB) -> L.build_not
   | _ -> Util.raise_codegen_error "Invalid types with unary operator."
+
+(**
+  Function incapsulating the logic of compile-time constant binary operators,
+  associating each operator and the types of its operands with the
+  LLVM instruction that constructs and implements it.
+  @param the binary operator, and a tuple indicating the types of the given values
+  @throws Codegen_error if the given operator and type combination is invalid.
+          This should theoretically never happen, as the types given
+          should have been semantically checked.
+*)
+let const_binary_operator = function
+  (* Constant integer binary operators *)
+  | (Add,   (TypI, TypI)) -> L.const_add
+  | (Sub,   (TypI, TypI)) -> L.const_sub
+  | (Mul,   (TypI, TypI)) -> L.const_mul
+  | (Div,   (TypI, TypI)) -> L.const_sdiv
+  | (Mod,   (TypI, TypI)) -> L.const_srem
+  | (Lt,    (TypI, TypI)) -> L.const_icmp L.Icmp.Slt
+  | (Le,    (TypI, TypI)) -> L.const_icmp L.Icmp.Sle
+  | (Gt,    (TypI, TypI)) -> L.const_icmp L.Icmp.Sgt
+  | (Ge,    (TypI, TypI)) -> L.const_icmp L.Icmp.Sge
+  | (Eq,    (TypI, TypI)) -> L.const_icmp L.Icmp.Eq
+  | (Neq,   (TypI, TypI)) -> L.const_icmp L.Icmp.Ne
+  (* Constant floating binary operators *)
+  | (Add,   (TypF, TypF)) -> L.const_fadd
+  | (Sub,   (TypF, TypF)) -> L.const_fsub
+  | (Mul,   (TypF, TypF)) -> L.const_fmul
+  | (Div,   (TypF, TypF)) -> L.const_fdiv
+  | (Lt,    (TypF, TypF)) -> L.const_fcmp L.Fcmp.Olt
+  | (Le,    (TypF, TypF)) -> L.const_fcmp L.Fcmp.Ole
+  | (Gt,    (TypF, TypF)) -> L.const_fcmp L.Fcmp.Ogt
+  | (Ge,    (TypF, TypF)) -> L.const_fcmp L.Fcmp.Oge
+  | (Eq,    (TypF, TypF)) -> L.const_fcmp L.Fcmp.Oeq
+  | (Neq,   (TypF, TypF)) -> L.const_fcmp L.Fcmp.One
+  (* Constant boolean operators *)
+  | (And,   (TypB, TypB)) -> L.const_and
+  | (Or,    (TypB, TypB)) -> L.const_or
+  (* Constant operations with characters: for now, only equality is allowed *)
+  | (Eq,    (TypC, TypC)) -> L.const_icmp L.Icmp.Eq
+  | (Neq,   (TypC, TypC)) -> L.const_icmp L.Icmp.Ne
+  (* Comma operator, reserved for future definitions of the operator *)
+  | (Comma, (_,    _))    -> (fun a b -> b)
+  (* Otherwise, invalid *)
+  | _ -> Util.raise_codegen_error "Invalid types with const binary operator"
+
+(**
+  Function incapsulating the logic of constant unary operators,
+  associating each operator and the type of its operand with the
+  LLVM instruction that constructs and implements it.
+  @param the unary operator, and the types of the operand given
+  @throws Codegen_error if the given operator and type combination is invalid.
+          This should theoretically never happen, as the type and operator given
+          should have been semantically checked.
+*)
+let const_unary_operator = function
+  | (Neg, TypI) -> L.const_neg
+  | (Neg, TypF) -> L.const_fneg
+  | (Not, TypB) -> L.const_not
+  | _ -> Util.raise_codegen_error "Invalid types with const unary operator."
 
 (**
   Function incapsulating the logic of implementing increment and
@@ -152,8 +220,10 @@ let rec lltype_of_typ struct_sym = function
   | TypC             -> char_type
   | TypF             -> float_type
   | TypA(t, Some(s)) -> L.array_type (lltype_of_typ struct_sym t) s
-  | TypA(t, None)      (* Unbounded arrays are for all purposes considered as pointers;
-                          clang and other tools compiling C to LLVM also do this *)
+  | TypA(t, None)       (* Unbounded arrays are for all purposes considered as pointers with
+                           clang and other tools compiling C to LLVM also do this.
+                           This behaviour is also supported in the C standard; for more info, see
+                           the report description. *)
   | TypP(t)          -> L.pointer_type (lltype_of_typ struct_sym t)
   | TypV             -> void_type
   | TypS(name)       ->
@@ -361,11 +431,11 @@ and build_binary_operator op block_maker a_maker b_maker builder types =
     let av = a_maker builder in
     let bv = b_maker builder in
     instr av bv "" builder
-  in match types with
-  | (TypB, TypB) -> build_boolean_operator op block_maker a_maker b_maker builder
-                    (* Obtain the concrete instruction operation for the given expression,
-                       and simply generate both expression using their maker closures *)
-  | _            -> strict_block_sequence (binary_operator (op, types))
+  in match op with
+  | And | Or -> build_boolean_operator op block_maker a_maker b_maker builder
+                (* Obtain the concrete instruction operation for the given expression,
+                   and simply generate both expression using their maker closures *)
+  | _        -> strict_block_sequence (binary_operator (op, types))
 
 (**
   Generate the LLVM code for a short-circuiting boolean application.
@@ -416,10 +486,18 @@ and build_boolean_operator op block_maker a_maker b_maker builder =
 (* Default variable initializer; exploit the Llvm.undef utility to give the same semantics as C. *)
 let var_initializer struct_sym t = L.undef (lltype_of_typ struct_sym t)
 
-(* Codegen a global variable initializer for the compile-time constant expression.
-   This function might in the future encapsulate and allocate values differently
-   compared to codegen_expr, since here we generate initializers for a static storage. *)
-let expr_initializer sym e = match e.node with
+(**
+  Codegen a global variable initializer for the compile-time constant expression.
+  This function might in the future encapsulate and allocate values differently
+  compared to codegen_expr, since here we generate initializers for a static storage.
+  Compile-time constants are calculated here using the corresponding constant version
+  of the binary/unary operators employed.
+  @param sym the current symbol table, used for struct types
+  @param e the expression to generate the initializer
+  @return the llvalue corresponding to the given constant value expression
+  @throws Codegen_error if an error occurs
+*)
+let rec expr_initializer sym e = match e.node with
   | ILiteral(i)  -> L.const_int int_type i
   | CLiteral(c)  -> L.const_int char_type (Char.code c)
   | BLiteral(b)  -> if b then llvm_true else llvm_false
@@ -429,7 +507,9 @@ let expr_initializer sym e = match e.node with
                        the standard codegen we generate a L.build_global_string instead. *)
                     L.const_stringz llcontext s
   | Null         -> L.const_pointer_null (lltype_of_typ sym.struct_sym e.ann)
-  | _ -> Util.raise_codegen_error @@ "Invalid non-constant global initializer."
+  | UnaryOp(uop, a)    -> const_unary_operator (uop, a.ann) (expr_initializer sym a)
+  | BinaryOp(op, a, b) -> const_binary_operator (op, (a.ann, b.ann)) (expr_initializer sym a) (expr_initializer sym b)
+  | _ -> Util.raise_codegen_error @@ "Invalid constant global initializer."
 
 (* Codegen a global variable declaration. *)
 let codegen_global llmodule sym (t, id) init =

@@ -35,9 +35,8 @@ let identifier = (letter | '_') (letter | digit | '_')*
 (* Numerical definitions for int and float *)
 
 let integer    = digit digit*
-let mantissa   = '.' digit*
 let exponent   = ['e' 'E'] ['-' '+']? digit+
-let float      = digit* mantissa? exponent?
+let float      = (digit digit* '.' digit* | digit* '.' digit digit*) exponent?
 
 (* Whitespace and newline definitions *)
 
@@ -106,7 +105,7 @@ rule token = parse
 
     (* Struct member access *)
 
-    | "."        { DOT   }
+    | "."        { DOT }
 
     (* Atomic information-carrying token elements *)
 

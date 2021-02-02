@@ -12,7 +12,7 @@ void print(int n) {
 }
 
 void printfloat(float f) {
-    printf("%.3f\n", f); // With just %f it might be platform-dependent
+    printf("%f\n", f);
 }
 
 void printchar(char c) {

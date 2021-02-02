@@ -179,20 +179,20 @@ stmt_:
     { DoWhile(b, e) }
   | "for" "(" x=option(expr) ";" y=option(expr) ";" z=option(expr) ")" b=stmt
     /* Desugar the for statement, while also keeping the correct
-         position annotation of the various sub-expressions.
-         The desugaring is intuitively described as follows:
+       position annotation of the various sub-expressions.
+       The desugaring is intuitively described as follows:
 
-         for ( x ; y ; z )
-            b
-         ------------------------------------------------->
-         {
-           x ;         // if not provided: empty statement
-           while ( y ) // if not provided: "true"
-               {
-                 b ;
-                 y ;   // if not provided: empty statement
-               }
-         }
+       for ( x ; y ; z )
+          b
+       ------------------------------------------------->
+       {
+         x ;         // if not provided: empty statement
+         while ( y ) // if not provided: "true"
+             {
+               b ;
+               y ;   // if not provided: empty statement
+             }
+       }
       */
     { let expr_to_stmt  e = annotate e.ann @@ Expr(e) in
       let stmt_in_block e = annotate e.ann @@ Stmt(e) in

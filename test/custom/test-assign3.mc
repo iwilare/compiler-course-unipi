@@ -16,7 +16,7 @@ int main() {
     */
     // does not work.
 
-    a[i++] += 10; // In this case, a++ would be incremented twice!
+    a[i++] += 10; // In this case, a++ would be incremented twice.
 
     print(a[0]);
     print(i);

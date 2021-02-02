@@ -103,7 +103,10 @@ let check_function_argument_type struct_sym loc t =
   check_type struct_sym loc t;
   match t with
   (* Functions that accept sized arrays effectively receive
-     just a pointer to the array, without copying it *)
+     just a pointer to the array, ignoring the size. Furthermore,
+     it is interesting to note that in the C language no type-matching
+     is actually required for the size of arrays when passing them
+     to functions; as a concrete example, check test-string11.mc *)
   | TypA(t, Some(_)) -> TypA(t, None)
   | t                -> t
 
@@ -130,6 +133,7 @@ let rec unify_type expected provided =
   match (expected, provided) with
   (* Unify NULL with any pointer type and return the most specific. *)
   | (TypP t, TypP TypV) -> Some(TypP t)
+  | (TypP TypV, TypP t) -> Some(TypP t)
   (* If an array with a certain size is required, only that size can be provided. *)
   | (TypA(t, Some(s)), TypA(t', Some(s'))) when s = s' -> Option.map (fun t -> TypA(t, Some(s))) (unify_type t t')
   (* However, if the required size is not specified, an array of any size can be provided. *)
@@ -155,6 +159,18 @@ let unify expected provided =
     unify_type expected provided.ann
 
 (**
+  Unify two types together, setting each other's annotations reciprocally.
+  This can be useful when dealing with pointer expressions, e.g.: NULL == a && a == NULL
+  @param expected the expected type
+  @param provided the type that has been provided to match with the former
+  @returns None if unification failed, Some(t) with the re-annotated AST expression
+*)
+let unify2 a b =
+  match (unify_type a.ann b.ann, unify_type b.ann a.ann) with
+    | (Some(uab), Some(uba)) -> Some({a with ann = uba}, {b with ann = uab})
+    | (_, _) -> None
+
+(**
   Function that incapsulates the checking logic for unary operators.
   @param loc the location to report the error to if an error occurs
   @param uop the unary operator
@@ -170,21 +186,29 @@ let check_unary_type loc uop a =
 
 (**
   Function that incapsulates the checking logic for binary operators.
+  This function returns a unified version of its parameters, which can for
+  example happen in the case of pointer equality.
   @param loc the location to report the error to if an error occurs
   @param uop the binary operator
-  @param a the type of the left expression given to the operator
-  @param b the type of the right expression given to the operator
-  @returns the resulting type of the operator
+  @param a the left expression given to the operator
+  @param b the right expression given to the operator
+  @returns the resulting type of the operator, with the two possibly unified operands
   @throws Semantic_error if an error occurs
 *)
 let check_binary_type loc op a b =
-  match (op, a, b, unify_type a b) with
-  | ((Add | Sub | Mul | Div), a, b,        Some(t)) -> t
-  | (Mod, TypI, TypI,                      Some(_)) -> TypI
-  | ((Eq | Neq | Lt | Le | Gt | Ge), a, b, Some(_)) -> TypB
-  | ((And | Or), TypB, TypB,               Some(_)) -> TypB
-  | (Comma, a, b,                                _) -> b
-  | _ -> Util.raise_semantic_error loc @@ "Invalid types " ^ show_typ(a) ^ " and " ^ show_typ(b) ^ " with binary operator " ^ show_binop(op) ^ "."
+  match (op, a.ann, b.ann) with
+  | ((Add | Sub | Mul | Div | Mod),  TypI, TypI) -> (a, b, TypI)
+  | ((Add | Sub | Mul | Div),        TypF, TypF) -> (a, b, TypF)
+  | ((Eq | Neq | Lt | Le | Gt | Ge), TypI, TypI) -> (a, b, TypB)
+  | ((Eq | Neq | Lt | Le | Gt | Ge), TypF, TypF) -> (a, b, TypB)
+  (* Pointer equality can be performed if the two expressions can be unified *)
+  | ((Neq | Eq), _, _) ->
+    (match unify2 a b with
+      | Some(au, ub) -> (au, ub, TypB)
+      | None -> Util.raise_semantic_error loc @@ "Invalid pointer equality " ^ show_typ(a.ann) ^ " and " ^ show_typ(b.ann) ^ " with binary operator " ^ show_binop(op) ^ ".")
+  | ((And | Or),                     TypB, TypB) -> (a, b, TypB)
+  | (Comma,                          _,    _)    -> (a, b, b.ann)
+  | _ -> Util.raise_semantic_error loc @@ "Invalid types " ^ show_typ(a.ann) ^ " and " ^ show_typ(b.ann) ^ " with binary operator " ^ show_binop(op) ^ "."
 
 (**
   Semantically check an access expression.
@@ -292,8 +316,8 @@ and check_expr sym e =
                           annotate return_type (UnaryOp(uop, et))
   | BinaryOp(op, a, b) -> let at = check_expr sym a in
                           let bt = check_expr sym b in
-                          let return_type = check_binary_type loc op at.ann bt.ann in
-                          annotate return_type (BinaryOp(op, at, bt))
+                          let (atu, btu, return_type) = check_binary_type loc op at bt in
+                          annotate return_type (BinaryOp(op, atu, btu))
   | Call(f, values)    -> let args = List.map (check_expr sym) values in
                           let (return_type, unified_args) = check_function_call loc sym f args in
                           annotate return_type (Call(f, unified_args))
@@ -348,16 +372,24 @@ let check_vardecl loc sym (t, id) =
 
 (**
   Encapsulates the logic of allowed global compile-time values.
-  For simplicity, the expression is simply checked to be a constant that
-  performs no compile-time calculations.
+  For simplicity, the expression is simply checked to be a constant
+  while allowing compile-time constant calculations.
+  @param loc the location to report any errors to
   @param sym the current symbol table
   @param e the expression being checked
   @return the semantically-checked expression given
   @throws Semantic_error if an error occurs
 *)
-let check_global_value sym t e = match e.node with
+let rec check_global_value loc sym e = match e.node with
   | SLiteral(_) | ILiteral(_) | CLiteral(_) | BLiteral(_) | FLiteral(_)
-  | Null -> check_expr sym e
+  | Null               -> check_expr sym e
+  | UnaryOp(uop, e)    -> let et = check_global_value loc sym e in
+                          let return_type = check_unary_type loc uop et.ann in
+                          annotate return_type (UnaryOp(uop, et))
+  | BinaryOp(op, a, b) -> let at = check_global_value loc sym a in
+                          let bt = check_global_value loc sym b in
+                          let (atu, btu, return_type) = check_binary_type loc op at bt in
+                          annotate return_type (BinaryOp(op, atu, btu))
   | _ -> Util.raise_semantic_error e.ann "Invalid non-constant initialization element."
 
 (**
@@ -379,7 +411,7 @@ let check_global_vardecl loc sym (t, id) init =
     (match unify t tv with
     | Some(utv) -> utv
     | None -> Util.raise_semantic_error loc @@ "Trying to initialize a variable with type " ^ show_typ(t) ^ " with a value of type " ^ show_typ(tv.ann) ^ ".") in
-  Option.map (fun e -> check_init_type (check_global_value sym t e)) init
+  Option.map (fun e -> check_init_type (check_global_value loc sym e)) init
 
 (**
   Function that incapsulates the logic of checking the type of a boolean condition,
