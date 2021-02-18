@@ -108,6 +108,7 @@ let check_function_argument_type struct_sym loc t =
      is actually required for the size of arrays when passing them
      to functions; as a concrete example, check test-string11.mc *)
   | TypA(t, Some(_)) -> TypA(t, None)
+  | TypP(TypV) -> Util.raise_semantic_error loc "Invalid reserved NULL type."
   | t                -> t
 
 (**
@@ -159,11 +160,12 @@ let unify expected provided =
     unify_type expected provided.ann
 
 (**
-  Unify two types together, setting each other's annotations reciprocally.
-  This can be useful when dealing with pointer expressions, e.g.: NULL == a && a == NULL
-  @param expected the expected type
-  @param provided the type that has been provided to match with the former
-  @returns None if unification failed, Some(t) with the re-annotated AST expression
+  Helper function that unifies two types together, setting each
+  other's annotations reciprocally. This can be useful when dealing
+  with pointer expressions, e.g.: NULL == a && a == NULL.
+  @param a the first  expression to unify
+  @param a the second expression to unify
+  @returns None if unification failed, Some(a, b) with two re-annotated AST expression
 *)
 let unify2 a b =
   match (unify_type a.ann b.ann, unify_type b.ann a.ann) with

@@ -407,8 +407,8 @@ and codegen_expr block_maker sym builder e =
       (match Symbol_table.lookup f sym.fun_sym with
         | Some(v) -> v
         | None    -> Util.raise_codegen_error @@ "Undefined function \"" ^ f ^ "\".") in
-    (* Sequentially generate (in a left-to-right evaluation order, as given by List.map)
-       the concrete function call arguments *)
+    (* Sequentially generate in a left-to-right evaluation order
+       the concrete function call arguments, as required by the tests *)
     let actuals = List.map (codegen_expr block_maker sym builder) args in
     L.build_call fundef (Array.of_list actuals) "" builder
 
